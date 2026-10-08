@@ -245,6 +245,8 @@ class ItemStatuses(Enum):
     """Проданный."""
     DRAFT = 7
     """Черновик (если предмет не выставлен на продажу)."""
+    DISCONTINUED = 8
+    """Товар вручную снят продавцом с продажи."""
 
 
 class ReviewStatuses(Enum):

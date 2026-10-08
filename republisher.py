@@ -24,7 +24,13 @@ ITEM_SLUG_RE = re.compile(r"^[0-9a-fA-F]{12}-[a-zA-Z0-9][a-zA-Z0-9-]*$")
 
 ACTIVE_STATUSES = {"APPROVED"}
 WAITING_STATUSES = {"PENDING_APPROVAL", "PENDING_MODERATION"}
-REPUBLISHABLE_STATUSES = {"SOLD", "EXPIRED", "DRAFT"}
+REPUBLISHABLE_STATUSES = {
+    "SOLD",
+    "EXPIRED",
+    "DRAFT",
+    "DISCONTINUED",
+    "UNPUBLISHED",
+}
 STOPPED_STATUSES = {"BLOCKED", "DECLINED"}
 
 
@@ -589,7 +595,18 @@ class Republisher:
         if not actual_item_id:
             raise RuntimeError("Playerok не вернул настоящий ID товара")
 
-        status = enum_name(getattr(item, "status", "")) or "UNKNOWN"
+        status = enum_name(getattr(item, "status", ""))
+        if not status:
+            # Playerok currently returns null/unknown `status` after the seller
+            # manually removes an item from sale. `mayBePublished=true` is the
+            # explicit server-side permission to publish that item again. Never
+            # infer this for deleted or non-publishable objects.
+            may_be_published = getattr(item, "may_be_published", None)
+            deleted_at = getattr(item, "deleted_at", None)
+            if may_be_published is True and not deleted_at:
+                status = "UNPUBLISHED"
+            else:
+                status = "UNKNOWN"
         priority = enum_name(getattr(item, "priority", "")) or "UNKNOWN"
         name = str(getattr(item, "name", "") or "без названия")
         saved = self.state.item(tracked_reference)
@@ -633,6 +650,18 @@ class Republisher:
             return "stopped"
         if status not in REPUBLISHABLE_STATUSES:
             raise RuntimeError(f"неизвестный/неподдерживаемый статус {status}")
+        if (
+            status == "DISCONTINUED"
+            and "UNKNOWN" in str(saved.get("last_error", "") or "").upper()
+        ):
+            # Older versions could not parse Playerok's DISCONTINUED value and
+            # stored an UNKNOWN failure cooldown. It must not delay the first
+            # valid republish after upgrading.
+            self.state.update(
+                tracked_reference,
+                last_failure_unix=None,
+                last_error=None,
+            )
         if self._cooldown_active(tracked_reference):
             return "cooldown"
 

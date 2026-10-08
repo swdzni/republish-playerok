@@ -28,6 +28,8 @@ def item(
     priority: str = "DEFAULT",
     owner_id: str = "seller",
     attributes: dict[str, str] | None = None,
+    may_be_published: bool | None = None,
+    deleted_at: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=item_id,
@@ -38,6 +40,8 @@ def item(
         user=SimpleNamespace(id=owner_id),
         category=SimpleNamespace(id="category"),
         attributes=attributes if attributes is not None else {"amount": "120"},
+        may_be_published=may_be_published,
+        deleted_at=deleted_at,
     )
 
 
@@ -302,6 +306,54 @@ class RepublisherTests(unittest.TestCase):
 
             self.assertFalse(manager.handle_event(event))
             self.assertEqual(account.get_calls, 0)
+
+    def test_manually_discontinued_item_is_republished(self):
+        item_id = "1f1b2592-43bf-6a60-de04-b2be340b9620"
+        with tempfile.TemporaryDirectory() as temp:
+            account = FakeAccount(
+                item(
+                    item_id,
+                    status="DISCONTINUED",
+                    may_be_published=False,
+                )
+            )
+            manager = self.make_manager(account, Path(temp))
+            manager.state.update(
+                item_id,
+                last_error="неизвестный/неподдерживаемый статус UNKNOWN",
+                last_failure_unix=999999999999,
+            )
+
+            self.assertEqual(manager.process_item(item_id, initial=True), "republished")
+            self.assertEqual(account.publish_calls, [(item_id, "free-default")])
+            self.assertEqual(manager.state.item(item_id)["last_action"], "republished_free")
+
+    def test_empty_status_with_explicit_publish_permission_is_republished(self):
+        item_id = "1f1b2592-43bf-6a60-de04-b2be340b9620"
+        with tempfile.TemporaryDirectory() as temp:
+            account = FakeAccount(
+                item(item_id, status="", may_be_published=True)
+            )
+            manager = self.make_manager(account, Path(temp))
+
+            self.assertEqual(manager.process_item(item_id, initial=True), "republished")
+            self.assertEqual(account.publish_calls, [(item_id, "free-default")])
+
+    def test_unknown_status_without_publish_permission_fails_closed(self):
+        item_id = "1f1b2592-43bf-6a60-de04-b2be340b9620"
+        with tempfile.TemporaryDirectory() as temp:
+            account = FakeAccount(
+                item(
+                    item_id,
+                    status="",
+                    may_be_published=False,
+                )
+            )
+            manager = self.make_manager(account, Path(temp))
+
+            with self.assertRaisesRegex(RuntimeError, "UNKNOWN"):
+                manager.process_item(item_id, initial=True)
+            self.assertEqual(account.publish_calls, [])
 
 
 if __name__ == "__main__":
