@@ -1,0 +1,15 @@
+{
+  "poll_interval_seconds": 10,
+  "item_request_delay_seconds": 0.5,
+  "request_timeout_seconds": 45,
+  "retry_attempts": 5,
+  "retry_base_delay_seconds": 5,
+  "retry_max_delay_seconds": 60,
+  "republish_cooldown_seconds": 30,
+  "republish_failure_cooldown_seconds": 300,
+  "heartbeat_interval_seconds": 300,
+  "log_level": "INFO",
+  "missing_attribute_defaults": {
+    "region": "global"
+  }
+}

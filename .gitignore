@@ -1,0 +1,8 @@
+.env
+.venv/
+logs/
+state.json
+state.*.json
+.republisher.lock
+__pycache__/
+*.py[cod]
