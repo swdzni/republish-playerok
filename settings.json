@@ -1,5 +1,10 @@
 {
   "poll_interval_seconds": 10,
+  "reconciliation_interval_seconds": 900,
+  "items_reload_interval_seconds": 30,
+  "event_reconnect_delay_seconds": 10,
+  "event_status_retry_attempts": 3,
+  "event_status_retry_delay_seconds": 3,
   "item_request_delay_seconds": 0.5,
   "request_timeout_seconds": 45,
   "retry_attempts": 5,

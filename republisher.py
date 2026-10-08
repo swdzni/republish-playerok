@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -115,6 +117,11 @@ def load_item_ids(path: Path) -> tuple[str, ...]:
 @dataclass(frozen=True)
 class Settings:
     poll_interval_seconds: float = 10.0
+    reconciliation_interval_seconds: float = 900.0
+    items_reload_interval_seconds: float = 30.0
+    event_reconnect_delay_seconds: float = 10.0
+    event_status_retry_attempts: int = 3
+    event_status_retry_delay_seconds: float = 3.0
     item_request_delay_seconds: float = 0.5
     request_timeout_seconds: int = 45
     retry_attempts: int = 5
@@ -135,6 +142,21 @@ class Settings:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
         result = cls(
             poll_interval_seconds=float(data.get("poll_interval_seconds", 10)),
+            reconciliation_interval_seconds=float(
+                data.get("reconciliation_interval_seconds", 900)
+            ),
+            items_reload_interval_seconds=float(
+                data.get("items_reload_interval_seconds", 30)
+            ),
+            event_reconnect_delay_seconds=float(
+                data.get("event_reconnect_delay_seconds", 10)
+            ),
+            event_status_retry_attempts=int(
+                data.get("event_status_retry_attempts", 3)
+            ),
+            event_status_retry_delay_seconds=float(
+                data.get("event_status_retry_delay_seconds", 3)
+            ),
             item_request_delay_seconds=float(data.get("item_request_delay_seconds", 0.5)),
             request_timeout_seconds=int(data.get("request_timeout_seconds", 45)),
             retry_attempts=int(data.get("retry_attempts", 5)),
@@ -155,6 +177,20 @@ class Settings:
         )
         if result.poll_interval_seconds < 1:
             raise ConfigurationError("poll_interval_seconds должен быть не меньше 1")
+        if result.reconciliation_interval_seconds < 60:
+            raise ConfigurationError(
+                "reconciliation_interval_seconds должен быть не меньше 60"
+            )
+        if result.items_reload_interval_seconds < 5:
+            raise ConfigurationError("items_reload_interval_seconds должен быть не меньше 5")
+        if result.event_reconnect_delay_seconds < 1:
+            raise ConfigurationError("event_reconnect_delay_seconds должен быть не меньше 1")
+        if result.event_status_retry_attempts < 1:
+            raise ConfigurationError("event_status_retry_attempts должен быть не меньше 1")
+        if result.event_status_retry_delay_seconds < 1:
+            raise ConfigurationError(
+                "event_status_retry_delay_seconds должен быть не меньше 1"
+            )
         if result.item_request_delay_seconds < 0:
             raise ConfigurationError("item_request_delay_seconds не может быть отрицательным")
         if result.request_timeout_seconds < 5:
@@ -261,6 +297,8 @@ class Republisher:
         self.stop_event = stop_event or threading.Event()
         self._known_ids: tuple[str, ...] = ()
         self._last_heartbeat = 0.0
+        self._processed_deal_ids: set[str] = set()
+        self._processed_deal_order: deque[str] = deque(maxlen=500)
 
     @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
@@ -697,43 +735,283 @@ class Republisher:
                     break
         return summary
 
-    def run_forever(self) -> None:
-        initial = True
-        while not self.stop_event.is_set():
-            started = time.monotonic()
-            summary = self.run_cycle(initial=initial)
-            if initial:
-                log.info(
-                    "Стартовая проверка завершена: проверено=%s, активно=%s, "
-                    "ожидают=%s, перевыставлено=%s, ошибок=%s",
-                    summary.checked,
-                    summary.active,
-                    summary.waiting,
-                    summary.republished,
-                    summary.failed,
-                )
-                initial = False
-                self._last_heartbeat = time.monotonic()
-            elif summary.republished or summary.failed:
-                log.info(
-                    "Цикл: проверено=%s, перевыставлено=%s, ошибок=%s",
-                    summary.checked,
-                    summary.republished,
-                    summary.failed,
-                )
-            elif time.monotonic() - self._last_heartbeat >= self.settings.heartbeat_interval_seconds:
-                log.info(
-                    "Работаю: отслеживается=%s, активно=%s, ожидают=%s, ошибок=%s",
-                    summary.checked,
-                    summary.active,
-                    summary.waiting,
-                    summary.failed,
-                )
-                self._last_heartbeat = time.monotonic()
+    def _reload_items_and_check_added(self) -> None:
+        """Hot-reload items.txt without rechecking items that were already tracked."""
+        try:
+            item_ids = load_item_ids(self.items_path)
+        except ConfigurationError as exc:
+            log.error(
+                "Не удалось перечитать items.txt: %s. Оставляю прежний список.", exc
+            )
+            return
 
-            elapsed = time.monotonic() - started
-            wait_for = max(0.0, self.settings.poll_interval_seconds - elapsed)
-            self._wait(wait_for)
+        previous = self._known_ids
+        if item_ids == previous:
+            return
+        added = [item_id for item_id in item_ids if item_id not in previous]
+        removed = [item_id for item_id in previous if item_id not in item_ids]
+        self._known_ids = item_ids
+        if added:
+            log.info("Добавлены в отслеживание: %s", ", ".join(added))
+        if removed:
+            log.info("Убраны из отслеживания: %s", ", ".join(removed))
+
+        # Only newly added entries need an immediate lookup. Existing entries are
+        # deliberately left alone until a sale event or the safety reconciliation.
+        for index, item_id in enumerate(added):
+            if self.stop_event.is_set():
+                break
+            try:
+                self.process_item(item_id, initial=True)
+            except Exception as exc:
+                if is_auth_error(exc):
+                    raise
+                self.state.update(
+                    item_id,
+                    last_error=str(exc),
+                    last_action="error",
+                    last_failure_unix=time.time(),
+                )
+                log.exception("❌ Новый товар %s: %s", item_id, exc)
+            if index + 1 < len(added) and self.settings.item_request_delay_seconds:
+                if self._wait(self.settings.item_request_delay_seconds):
+                    break
+
+    def _tracked_reference_for_item(
+        self, actual_item_id: str, item_slug: str = ""
+    ) -> str | None:
+        actual = actual_item_id.casefold()
+        slug = item_slug.casefold()
+        for reference in self._known_ids:
+            if reference.casefold() in {actual, slug}:
+                return reference
+            resolved = str(
+                self.state.item(reference).get("resolved_item_id", "") or ""
+            ).casefold()
+            if resolved and resolved == actual:
+                return reference
+        return None
+
+    def _remember_deal(self, deal_id: str) -> bool:
+        """Return False for a duplicate event while keeping memory bounded."""
+        if deal_id in self._processed_deal_ids:
+            return False
+        if len(self._processed_deal_order) == self._processed_deal_order.maxlen:
+            oldest = self._processed_deal_order.popleft()
+            self._processed_deal_ids.discard(oldest)
+        self._processed_deal_order.append(deal_id)
+        self._processed_deal_ids.add(deal_id)
+        return True
+
+    @staticmethod
+    def _is_new_deal_event(event: Any) -> bool:
+        event_type = enum_name(getattr(event, "type", ""))
+        return event.__class__.__name__ == "NewDealEvent" or event_type == "NEW_DEAL"
+
+    def handle_event(self, event: Any) -> bool:
+        """Handle one Playerok event and touch only its tracked item."""
+        if not self._is_new_deal_event(event):
+            return False
+        deal = getattr(event, "deal", None)
+        deal_id = str(getattr(deal, "id", "") or "")
+        deal_item = getattr(deal, "item", None)
+        actual_item_id = str(getattr(deal_item, "id", "") or "")
+        item_slug = str(getattr(deal_item, "slug", "") or "")
+        if not deal_id or not actual_item_id:
+            log.warning(
+                "Событие новой сделки не содержит deal/item ID; его подхватит "
+                "страховочная сверка."
+            )
+            return False
+
+        reference = self._tracked_reference_for_item(actual_item_id, item_slug)
+        if reference is None:
+            log.debug(
+                "Новая сделка %s относится к неотслеживаемому товару %s — пропуск.",
+                deal_id,
+                actual_item_id,
+            )
+            return False
+        if not self._remember_deal(deal_id):
+            log.debug("Повтор события сделки %s безопасно пропущен.", deal_id)
+            return True
+
+        log.info(
+            "🛒 Новая сделка %s по товару %s. Проверяю только этот ID.",
+            deal_id,
+            actual_item_id,
+        )
+        attempts = self.settings.event_status_retry_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                result = self.process_item(reference)
+            except Exception as exc:
+                if is_auth_error(exc):
+                    raise
+                self.state.update(
+                    reference,
+                    last_error=str(exc),
+                    last_action="error",
+                    last_failure_unix=time.time(),
+                )
+                log.exception(
+                    "❌ Сделка %s, товар %s: %s", deal_id, actual_item_id, exc
+                )
+                return True
+
+            # Playerok occasionally emits the payment event a moment before the
+            # item endpoint changes APPROVED -> SOLD. Retry this one item only.
+            if result == "active" and attempt < attempts:
+                log.info(
+                    "%s ещё отображается активным после сделки %s; повтор %s/%s "
+                    "через %.0f сек.",
+                    actual_item_id,
+                    deal_id,
+                    attempt + 1,
+                    attempts,
+                    self.settings.event_status_retry_delay_seconds,
+                )
+                if self._wait(self.settings.event_status_retry_delay_seconds):
+                    return True
+                continue
+            if result == "active":
+                log.warning(
+                    "%s после сделки %s всё ещё APPROVED. Оставляю его до "
+                    "страховочной сверки, чтобы не спамить API.",
+                    actual_item_id,
+                    deal_id,
+                )
+            return True
+        return True
+
+    def _event_worker(self, output: "queue.Queue[Any]") -> None:
+        """Listen to WebSocket events without the library's periodic deal polling."""
+        from playerokapi.listener.listener import EventListener
+
+        while not self.stop_event.is_set():
+            try:
+                listener = EventListener(self.account)
+
+                # The bundled library normally starts listen_new_deals(), which
+                # calls get_chats every ~15 seconds even when nothing happened.
+                # NewDealEvent is already emitted by the WebSocket message path,
+                # so replace that polling generator with an idle one. A rare full
+                # reconciliation below is the fallback for a missed WS event.
+                def no_periodic_deal_polling() -> Iterable[Any]:
+                    while not self.stop_event.wait(60):
+                        if False:  # keep this function a generator
+                            yield None
+
+                listener.listen_new_deals = no_periodic_deal_polling
+
+                original_messages = listener.listen_new_messages
+
+                def resilient_messages() -> Iterable[Any]:
+                    delay = self.settings.event_reconnect_delay_seconds
+                    while not self.stop_event.is_set():
+                        try:
+                            yield from original_messages()
+                            if self.stop_event.is_set():
+                                return
+                            raise RuntimeError("поток WebSocket завершился")
+                        except Exception as exc:
+                            if self.stop_event.is_set():
+                                return
+                            log.warning(
+                                "WebSocket Playerok потерял соединение (%s). "
+                                "Переподключение через %.0f сек.",
+                                exc,
+                                delay,
+                            )
+                            if self._wait(delay):
+                                return
+
+                listener.listen_new_messages = resilient_messages
+                log.info(
+                    "Слушатель продаж запущен: проверки товаров идут только по "
+                    "событию новой сделки."
+                )
+                for event in listener.listen(get_new_review_events=False):
+                    if self.stop_event.is_set():
+                        return
+                    if self._is_new_deal_event(event):
+                        output.put(event)
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    return
+                log.exception(
+                    "Слушатель Playerok остановился: %s. Перезапуск через %.0f сек.",
+                    exc,
+                    self.settings.event_reconnect_delay_seconds,
+                )
+                if self._wait(self.settings.event_reconnect_delay_seconds):
+                    return
+
+    def run_forever(self) -> None:
+        summary = self.run_cycle(initial=True)
+        log.info(
+            "Стартовая проверка завершена: проверено=%s, активно=%s, "
+            "ожидают=%s, перевыставлено=%s, ошибок=%s",
+            summary.checked,
+            summary.active,
+            summary.waiting,
+            summary.republished,
+            summary.failed,
+        )
+
+        events: queue.Queue[Any] = queue.Queue()
+        threading.Thread(
+            target=self._event_worker,
+            args=(events,),
+            name="playerok-sale-listener",
+            daemon=True,
+        ).start()
+
+        now = time.monotonic()
+        next_reconciliation = now + self.settings.reconciliation_interval_seconds
+        next_items_reload = now + self.settings.items_reload_interval_seconds
+        self._last_heartbeat = now
+        while not self.stop_event.is_set():
+            now = time.monotonic()
+            timeout = max(
+                0.1,
+                min(next_reconciliation, next_items_reload, self._last_heartbeat + self.settings.heartbeat_interval_seconds) - now,
+            )
+            try:
+                event = events.get(timeout=min(timeout, 5.0))
+            except queue.Empty:
+                event = None
+            if event is not None:
+                self.handle_event(event)
+
+            now = time.monotonic()
+            if now >= next_items_reload:
+                self._reload_items_and_check_added()
+                next_items_reload = now + self.settings.items_reload_interval_seconds
+
+            if now >= next_reconciliation:
+                log.info(
+                    "Страховочная сверка: проверяю весь список после %.0f минут.",
+                    self.settings.reconciliation_interval_seconds / 60,
+                )
+                summary = self.run_cycle()
+                if summary.republished or summary.failed:
+                    log.info(
+                        "Сверка: проверено=%s, перевыставлено=%s, ошибок=%s",
+                        summary.checked,
+                        summary.republished,
+                        summary.failed,
+                    )
+                next_reconciliation = time.monotonic() + self.settings.reconciliation_interval_seconds
+
+            if time.monotonic() - self._last_heartbeat >= self.settings.heartbeat_interval_seconds:
+                log.info(
+                    "Работаю: отслеживается=%s; жду события новых сделок. "
+                    "Следующая страховочная сверка не чаще чем раз в %.0f минут.",
+                    len(self._known_ids),
+                    self.settings.reconciliation_interval_seconds / 60,
+                )
+                self._last_heartbeat = time.monotonic()
 
 
 class SingleInstance:
@@ -745,6 +1023,27 @@ class SingleInstance:
     def _pid_is_alive(pid: int) -> bool:
         if pid <= 0:
             return False
+        if os.name == "nt":
+            # os.kill(pid, 0) is not a reliable existence check on Windows and
+            # can raise SystemError/WinError 87 for an already exited process.
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            error_access_denied = 5
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            open_process.restype = wintypes.HANDLE
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+
+            handle = open_process(process_query_limited_information, False, pid)
+            if handle:
+                close_handle(handle)
+                return True
+            return ctypes.get_last_error() == error_access_denied
         try:
             os.kill(pid, 0)
         except ProcessLookupError:

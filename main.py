@@ -146,8 +146,9 @@ def main() -> int:
             return 1 if summary.failed else 0
 
         logger.info(
-            "Мониторинг запущен. Проверка каждые %.1f сек. Остановка: Ctrl+C.",
-            settings.poll_interval_seconds,
+            "Мониторинг запущен. Основной режим: события новых сделок; "
+            "страховочная сверка раз в %.0f мин. Остановка: Ctrl+C.",
+            settings.reconciliation_interval_seconds / 60,
         )
         republisher.run_forever()
         logger.info("Скрипт остановлен.")

@@ -46,6 +46,7 @@ class FakeAccount:
 
     def __init__(self, current: SimpleNamespace):
         self.current = current
+        self.get_calls = 0
         self.priority_statuses = [
             SimpleNamespace(id="free-default", type=named("DEFAULT"), price=0)
         ]
@@ -53,6 +54,7 @@ class FakeAccount:
         self.priority_calls = 0
 
     def get_item(self, id: str | None = None, slug: str | None = None) -> SimpleNamespace:
+        self.get_calls += 1
         self.last_lookup = (id, slug)
         return self.current
 
@@ -259,6 +261,47 @@ class RepublisherTests(unittest.TestCase):
             self.assertEqual(set(kwargs), {"options"})
             selected = {option.field: option.value for option in kwargs["options"]}
             self.assertEqual(selected, {"amount": "120", "region": "global"})
+
+    def test_new_deal_event_checks_only_matching_tracked_item(self):
+        item_id = "1f1b2592-43bf-6a60-de04-b2be340b9620"
+        with tempfile.TemporaryDirectory() as temp:
+            account = FakeAccount(item(item_id, status="SOLD"))
+            manager = self.make_manager(account, Path(temp))
+            manager._known_ids = (item_id,)
+            event = SimpleNamespace(
+                type=named("NEW_DEAL"),
+                deal=SimpleNamespace(
+                    id="deal-1",
+                    item=SimpleNamespace(id=item_id, slug=""),
+                ),
+            )
+
+            self.assertTrue(manager.handle_event(event))
+            self.assertEqual(account.get_calls, 1)
+            self.assertEqual(account.publish_calls, [(item_id, "free-default")])
+
+            # The listener can expose NEW_DEAL and ITEM_PAID for the same deal.
+            # A duplicate must not query the item again.
+            self.assertTrue(manager.handle_event(event))
+            self.assertEqual(account.get_calls, 1)
+
+    def test_new_deal_for_untracked_item_makes_no_item_request(self):
+        tracked_id = "1f1b2592-43bf-6a60-de04-b2be340b9620"
+        other_id = "2f1b2592-43bf-6a60-de04-b2be340b9620"
+        with tempfile.TemporaryDirectory() as temp:
+            account = FakeAccount(item(tracked_id, status="APPROVED"))
+            manager = self.make_manager(account, Path(temp))
+            manager._known_ids = (tracked_id,)
+            event = SimpleNamespace(
+                type=named("NEW_DEAL"),
+                deal=SimpleNamespace(
+                    id="deal-other",
+                    item=SimpleNamespace(id=other_id, slug=""),
+                ),
+            )
+
+            self.assertFalse(manager.handle_event(event))
+            self.assertEqual(account.get_calls, 0)
 
 
 if __name__ == "__main__":
