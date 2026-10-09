@@ -1,6 +1,1 @@
-# Вставьте ID отслеживаемых товаров: один UUID на строку.
-# Строки с # и пустые строки игнорируются. Файл можно менять во время работы.
-#
-# Пример:
-# 1f1b2592-43bf-6a60-de04-b2be340b9620
-https://playerok.com/products/916db2a8acf4-robuksy-bobuksy-80-shtuchek
+https://playerok.com/products/a169badf7ddb-robuxi-teestt
